@@ -24,16 +24,273 @@ import json
 import asyncio
 import aiohttp
 import ipaddress
+import threading
+import struct
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib3.exceptions import InsecureRequestWarning
+from requests.adapters import HTTPAdapter
+
+# 确保 Windows 下控制台输出为 UTF-8 编码
+if hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
 
 # 修复 Windows 下 ProactorEventLoop 残留任务报警
-if sys.platform == 'win32':
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+if sys.platform == 'win32' and sys.version_info < (3, 14):
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    except Exception:
+        pass
 
 # 禁用 SSL 警告 (用于 HTTP 检测)
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+# ==================== 物理网卡与 TUN 旁路支持 ====================
+def detect_physical_interface(target=""):
+    """
+    自动检测/指定主机的物理出口网卡（绕过 TUN / VPN 虚拟网卡与代理劫持）
+    返回 dict: {'index': int, 'name': str, 'desc': str, 'ip': str, 'gateways': list} 或 None
+    """
+    target = (target or "").strip().lower()
+
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            GAA_FLAG_INCLUDE_GATEWAYS = 0x0080
+            AF_INET = 2
+
+            class SOCKET_ADDRESS(ctypes.Structure):
+                _fields_ = [('lpSockaddr', ctypes.c_void_p), ('iSockaddrLength', ctypes.c_int)]
+
+            class IP_ADAPTER_UNICAST_ADDRESS(ctypes.Structure):
+                pass
+            IP_ADAPTER_UNICAST_ADDRESS._fields_ = [
+                ('Length', wintypes.ULONG),
+                ('Flags', wintypes.DWORD),
+                ('Next', ctypes.POINTER(IP_ADAPTER_UNICAST_ADDRESS)),
+                ('Address', SOCKET_ADDRESS),
+            ]
+
+            class IP_ADAPTER_GATEWAY_ADDRESS(ctypes.Structure):
+                pass
+            IP_ADAPTER_GATEWAY_ADDRESS._fields_ = [
+                ('Length', wintypes.ULONG),
+                ('Flags', wintypes.DWORD),
+                ('Next', ctypes.POINTER(IP_ADAPTER_GATEWAY_ADDRESS)),
+                ('Address', SOCKET_ADDRESS),
+            ]
+
+            class IP_ADAPTER_ADDRESSES(ctypes.Structure):
+                pass
+            IP_ADAPTER_ADDRESSES._fields_ = [
+                ('Length', wintypes.ULONG),
+                ('IfIndex', wintypes.DWORD),
+                ('Next', ctypes.POINTER(IP_ADAPTER_ADDRESSES)),
+                ('AdapterName', ctypes.c_char_p),
+                ('FirstUnicastAddress', ctypes.POINTER(IP_ADAPTER_UNICAST_ADDRESS)),
+                ('FirstAnycastAddress', ctypes.c_void_p),
+                ('FirstMulticastAddress', ctypes.c_void_p),
+                ('FirstDnsServerAddress', ctypes.c_void_p),
+                ('DnsSuffix', wintypes.LPWSTR),
+                ('Description', wintypes.LPWSTR),
+                ('FriendlyName', wintypes.LPWSTR),
+                ('PhysicalAddress', ctypes.c_ubyte * 8),
+                ('PhysicalAddressLength', wintypes.DWORD),
+                ('Flags', wintypes.DWORD),
+                ('Mtu', wintypes.DWORD),
+                ('IfType', wintypes.DWORD),
+                ('OperStatus', ctypes.c_int),
+                ('Ipv6IfIndex', wintypes.DWORD),
+                ('ZoneIndices', wintypes.DWORD * 16),
+                ('FirstPrefix', ctypes.c_void_p),
+                ('TransmitLinkSpeed', ctypes.c_uint64),
+                ('ReceiveLinkSpeed', ctypes.c_uint64),
+                ('FirstWinsServerAddress', ctypes.c_void_p),
+                ('FirstGatewayAddress', ctypes.POINTER(IP_ADAPTER_GATEWAY_ADDRESS)),
+            ]
+
+            class sockaddr_in(ctypes.Structure):
+                _fields_ = [
+                    ('sin_family', ctypes.c_short),
+                    ('sin_port', ctypes.c_ushort),
+                    ('sin_addr', ctypes.c_ubyte * 4),
+                    ('sin_zero', ctypes.c_char * 8),
+                ]
+
+            iphlpapi = ctypes.windll.iphlpapi
+            buflen = wintypes.ULONG(15000)
+            buf = ctypes.create_string_buffer(buflen.value)
+            ret = iphlpapi.GetAdaptersAddresses(AF_INET, GAA_FLAG_INCLUDE_GATEWAYS, None, buf, ctypes.byref(buflen))
+            if ret == 111:  # ERROR_BUFFER_OVERFLOW
+                buf = ctypes.create_string_buffer(buflen.value)
+                ret = iphlpapi.GetAdaptersAddresses(AF_INET, GAA_FLAG_INCLUDE_GATEWAYS, None, buf, ctypes.byref(buflen))
+            if ret != 0:
+                return None
+
+            blacklist = ['meta', 'clash', 'sing-box', 'wintun', 'tap', 'tun', 'tailscale',
+                         'zerotier', 'wireguard', 'openvpn', 'virtual', 'loopback', 'hyper-v',
+                         'vmware', 'vbox', 'npcap', 'bluetooth', 'ppp', 'vpn']
+
+            curr = ctypes.cast(buf, ctypes.POINTER(IP_ADAPTER_ADDRESSES))
+            candidates = []
+            while curr:
+                a = curr.contents
+                friendly_name = a.FriendlyName or ''
+                description = a.Description or ''
+                if_index = a.IfIndex
+                if_type = a.IfType
+                oper_status = a.OperStatus
+
+                ips = []
+                u = a.FirstUnicastAddress
+                while u:
+                    sa_ptr = u.contents.Address.lpSockaddr
+                    if sa_ptr:
+                        sa = ctypes.cast(sa_ptr, ctypes.POINTER(sockaddr_in)).contents
+                        if sa.sin_family == AF_INET:
+                            ip_str = '.'.join(map(str, sa.sin_addr))
+                            ips.append(ip_str)
+                    u = u.contents.Next
+
+                gateways = []
+                g = a.FirstGatewayAddress
+                while g:
+                    sa_ptr = g.contents.Address.lpSockaddr
+                    if sa_ptr:
+                        sa = ctypes.cast(sa_ptr, ctypes.POINTER(sockaddr_in)).contents
+                        if sa.sin_family == AF_INET:
+                            gw_str = '.'.join(map(str, sa.sin_addr))
+                            gateways.append(gw_str)
+                    g = g.contents.Next
+
+                curr = a.Next
+
+                if oper_status != 1 or if_type == 24:  # not Up or Loopback
+                    continue
+
+                valid_ips = [ip for ip in ips if not (ip.startswith('127.') or ip.startswith('169.254.') or ip.startswith('198.18.') or ip.startswith('198.19.'))]
+                if not valid_ips:
+                    continue
+
+                desc_l = description.lower()
+                name_l = friendly_name.lower()
+
+                if target:
+                    if (target in name_l) or (target in desc_l) or any(target == ip.lower() for ip in valid_ips):
+                        return {
+                            'index': if_index,
+                            'name': friendly_name,
+                            'desc': description,
+                            'ip': valid_ips[0],
+                            'gateways': gateways,
+                            'has_gw': len(gateways) > 0,
+                            'is_physical_type': if_type in (6, 71)
+                        }
+                    continue
+
+                if any(kw in desc_l or kw in name_l for kw in blacklist):
+                    continue
+
+                candidates.append({
+                    'index': if_index,
+                    'name': friendly_name,
+                    'desc': description,
+                    'ip': valid_ips[0],
+                    'gateways': gateways,
+                    'has_gw': len(gateways) > 0,
+                    'is_physical_type': if_type in (6, 71)
+                })
+
+            if candidates:
+                candidates.sort(key=lambda x: (x['has_gw'], x['is_physical_type']), reverse=True)
+                return candidates[0]
+        except Exception:
+            pass
+
+    elif sys.platform.startswith("linux"):
+        try:
+            import fcntl
+
+            def get_ip_address(ifname):
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                return socket.inet_ntoa(fcntl.ioctl(
+                    s.fileno(),
+                    0x8915,  # SIOCGIFADDR
+                    struct.pack('256s', ifname[:15].encode('utf-8'))
+                )[20:24])
+
+            gateways = []
+            if os.path.exists('/proc/net/route'):
+                with open('/proc/net/route', 'r') as f:
+                    for line in f.readlines()[1:]:
+                        fields = line.strip().split()
+                        if len(fields) >= 3 and fields[1] == '00000000':
+                            ifname = fields[0]
+                            gw_hex = fields[2]
+                            gw_ip = socket.inet_ntoa(struct.pack('<L', int(gw_hex, 16)))
+                            gateways.append((ifname, gw_ip))
+
+            blacklist = ['tun', 'tap', 'clash', 'meta', 'sing', 'utun', 'wg', 'docker', 'veth', 'lo']
+            for ifname, gw_ip in gateways:
+                if target:
+                    if target == ifname.lower():
+                        ip = get_ip_address(ifname)
+                        return {'name': ifname, 'ip': ip, 'gateways': [gw_ip], 'index': 0}
+                    continue
+                if any(ifname.startswith(b) for b in blacklist):
+                    continue
+                try:
+                    ip = get_ip_address(ifname)
+                    if ip and not ip.startswith('127.') and not ip.startswith('198.18.'):
+                        return {'name': ifname, 'ip': ip, 'gateways': [gw_ip], 'index': 0}
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    elif sys.platform == "darwin":
+        try:
+            res = subprocess.run(["route", "-n", "get", "default"], capture_output=True, text=True, timeout=2)
+            if res.returncode == 0:
+                m_if = re.search(r'interface:\s*(\S+)', res.stdout)
+                m_gw = re.search(r'gateway:\s*(\S+)', res.stdout)
+                if m_if:
+                    ifname = m_if.group(1)
+                    if not ifname.startswith('utun'):
+                        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                        s.connect(('8.8.8.8', 80))
+                        ip = s.getsockname()[0]
+                        s.close()
+                        return {'name': ifname, 'ip': ip, 'gateways': [m_gw.group(1)] if m_gw else [], 'index': 0}
+        except Exception:
+            pass
+
+    return None
+
+class PhysicalInterfaceHTTPAdapter(HTTPAdapter):
+    """用于将 requests HTTP/HTTPS 请求绑定到物理网卡以绕过 TUN 拦截"""
+    def __init__(self, source_ip=None, if_index=None, if_name=None, *args, **kwargs):
+        self.source_ip = source_ip
+        self.if_index = if_index
+        self.if_name = if_name
+        super().__init__(*args, **kwargs)
+
+    def init_poolmanager(self, *args, **kwargs):
+        if self.source_ip:
+            kwargs['source_address'] = (self.source_ip, 0)
+        socket_options = list(kwargs.get('socket_options') or [])
+        if self.if_index and sys.platform == 'win32':
+            socket_options.append((socket.IPPROTO_IP, 31, struct.pack('!I', self.if_index)))
+        elif self.if_name and sys.platform != 'win32':
+            socket_options.append((socket.SOL_SOCKET, getattr(socket, 'SO_BINDTODEVICE', 25), self.if_name.encode()))
+        if socket_options:
+            kwargs['socket_options'] = socket_options
+        return super().init_poolmanager(*args, **kwargs)
 
 # ==================== 预编译正则 ====================
 NODE_PATTERN = re.compile(r"^(\d+\.\d+\.\d+\.\d+):(\d+)#(.+)$")
@@ -220,6 +477,8 @@ def load_config():
         "ENABLE_LOGGING": False,
         "LOG_FILE": "cfnb.log",
         "FORCE_DIRECT": False,
+        "TUN_BYPASS_ENABLED": True,
+        "PHYSICAL_INTERFACE": "",
         "TEST_AVAILABILITY": True,
         "AVAILABILITY_CHECK_API": "https://api.090227.xyz/check",
         "AVAILABILITY_TIMEOUT": 3,
@@ -345,6 +604,38 @@ OUTPUT_FILE = cfg["OUTPUT_FILE"]
 ENABLE_LOGGING = cfg["ENABLE_LOGGING"]
 LOG_FILE = cfg["LOG_FILE"]
 FORCE_DIRECT = cfg["FORCE_DIRECT"]
+TUN_BYPASS_ENABLED = cfg["TUN_BYPASS_ENABLED"]
+PHYSICAL_INTERFACE = cfg["PHYSICAL_INTERFACE"]
+
+# 检测物理网卡出口（TUN 旁路直连模式）
+PHYSICAL_ADAPTER_INFO = None
+BIND_PHYSICAL_IP = None
+BIND_IF_INDEX = None
+BIND_IF_NAME = None
+
+if TUN_BYPASS_ENABLED:
+    PHYSICAL_ADAPTER_INFO = detect_physical_interface(PHYSICAL_INTERFACE)
+    if PHYSICAL_ADAPTER_INFO:
+        BIND_PHYSICAL_IP = PHYSICAL_ADAPTER_INFO.get('ip')
+        BIND_IF_INDEX = PHYSICAL_ADAPTER_INFO.get('index')
+        BIND_IF_NAME = PHYSICAL_ADAPTER_INFO.get('name')
+
+_http_test_local = threading.local()
+
+def get_http_test_session():
+    if not hasattr(_http_test_local, "session"):
+        s = requests.Session()
+        if BIND_PHYSICAL_IP or BIND_IF_INDEX or BIND_IF_NAME:
+            adapter = PhysicalInterfaceHTTPAdapter(
+                source_ip=BIND_PHYSICAL_IP,
+                if_index=BIND_IF_INDEX,
+                if_name=BIND_IF_NAME
+            )
+            s.mount('http://', adapter)
+            s.mount('https://', adapter)
+        _http_test_local.session = s
+    return _http_test_local.session
+
 TEST_AVAILABILITY = cfg["TEST_AVAILABILITY"]
 AVAILABILITY_CHECK_API = cfg["AVAILABILITY_CHECK_API"]
 AVAILABILITY_TIMEOUT = cfg["AVAILABILITY_TIMEOUT"]
@@ -987,6 +1278,21 @@ def test_tcp_latency(ip, port, timeout=TIMEOUT, probes=TCP_PROBES):
             start = time.time()
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.settimeout(timeout)
+                if BIND_PHYSICAL_IP:
+                    try:
+                        sock.bind((BIND_PHYSICAL_IP, 0))
+                    except Exception:
+                        pass
+                if BIND_IF_INDEX and sys.platform == 'win32':
+                    try:
+                        sock.setsockopt(socket.IPPROTO_IP, 31, struct.pack('!I', BIND_IF_INDEX))
+                    except Exception:
+                        pass
+                elif BIND_IF_NAME and sys.platform != 'win32':
+                    try:
+                        sock.setsockopt(socket.SOL_SOCKET, getattr(socket, 'SO_BINDTODEVICE', 25), BIND_IF_NAME.encode())
+                    except Exception:
+                        pass
                 sock.connect((ip, int(port)))
             latency = time.time() - start
             if latency < min_latency:
@@ -1065,10 +1371,11 @@ def check_http_server(node_str, timeout, max_retries, retry_delay, method, conne
                 "proxies": {"http": None, "https": None}
             }
 
+            session = get_http_test_session()
             if method.upper() == "HEAD":
-                resp = requests.head(url, **request_kwargs)
+                resp = session.head(url, **request_kwargs)
             else:
-                resp = requests.get(url, **request_kwargs)
+                resp = session.get(url, **request_kwargs)
 
             lat = (time.time() - start) * 1000
             if resp.status_code != 400:
@@ -1197,6 +1504,22 @@ def http_server_filter(candidates, config):
     print(f"HTTP检测经 {max_rounds} 轮重试后仍无节点通过，降级使用过滤前候选列表。")
     return candidates, {}, {}
 
+_CURL_SUPPORTS_HTTP2 = None
+
+def check_curl_http2_support():
+    global _CURL_SUPPORTS_HTTP2
+    if _CURL_SUPPORTS_HTTP2 is not None:
+        return _CURL_SUPPORTS_HTTP2
+    if not shutil.which("curl"):
+        _CURL_SUPPORTS_HTTP2 = False
+        return False
+    try:
+        res = subprocess.run(["curl", "--version"], capture_output=True, text=True, timeout=2)
+        _CURL_SUPPORTS_HTTP2 = (res.returncode == 0 and "HTTP2" in res.stdout)
+    except Exception:
+        _CURL_SUPPORTS_HTTP2 = False
+    return _CURL_SUPPORTS_HTTP2
+
 def measure_bandwidth_curl(node_str):
     m = IP_PORT_PATTERN.match(node_str)
     if not m:
@@ -1211,14 +1534,22 @@ def measure_bandwidth_curl(node_str):
         "-w", "%{size_download} %{time_starttransfer} %{time_total}",
         "-L",
         "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-        "--http2",
-        "--noproxy", "*",
+    ]
+    if check_curl_http2_support():
+        curl_cmd.append("--http2")
+    if BIND_PHYSICAL_IP:
+        curl_cmd.extend(["--interface", BIND_PHYSICAL_IP])
+    elif BIND_IF_NAME:
+        curl_cmd.extend(["--interface", BIND_IF_NAME])
+    if FORCE_DIRECT:
+        curl_cmd.extend(["--noproxy", "*"])
+    curl_cmd.extend([
         "--resolve", f"speed.cloudflare.com:{port}:{ip}",
         "--connect-timeout", str(BANDWIDTH_CONNECT_TIMEOUT),
         "--max-time", str(BANDWIDTH_TIMEOUT),
         "--insecure",
         BANDWIDTH_URL
-    ]
+    ])
 
     try:
         result = subprocess.run(curl_cmd, capture_output=True, text=True,
@@ -1628,10 +1959,20 @@ def main():
     mode_str = f"全局最优{GLOBAL_TOP_N}个" if USE_GLOBAL_MODE else f"每个国家最优{PER_COUNTRY_TOP_N}个"
     print(f"当前模式：{mode_str}，每个节点测试 {TCP_PROBES} 次 TCP 连接")
     print(f"最低成功率要求：{MIN_SUCCESS_RATE*100:.0f}%")
+    if TUN_BYPASS_ENABLED and PHYSICAL_ADAPTER_INFO:
+        ad_name = PHYSICAL_ADAPTER_INFO.get('name', 'Unknown')
+        ad_ip = PHYSICAL_ADAPTER_INFO.get('ip', 'Unknown')
+        ad_gw = ', '.join(PHYSICAL_ADAPTER_INFO.get('gateways', [])) or '自动'
+        print(f"TUN 旁路直连模式：已启用（已绑定物理网卡：{ad_name} | 本地IP: {ad_ip} | 网关: {ad_gw}）")
+    elif TUN_BYPASS_ENABLED:
+        print("TUN 旁路直连模式：已启用（未检测到独立物理网卡，使用系统默认路由）")
+    else:
+        print("TUN 旁路直连模式：已禁用")
     print(f"IP 可用性二次筛选：{'启用' if TEST_AVAILABILITY else '禁用'}（仅对候选节点）")
     print(f"HTTP检测：{'启用' if HTTP_TEST_ENABLED else '禁用'}（仅对候选节点）")
     print(f"IPv6 客户端 IP 过滤（仅作用于DNS更新环节）：{'启用' if FILTER_IPV6_AVAILABILITY else '禁用'}")
-    print(f"DNS黑名单过滤：{'启用' if FILTER_BLOCKED_COUNTRIES_ENABLED else '禁用'}，黑名单国家：{', '.join(BLOCKED_COUNTRIES)}")
+    bc_str = (', '.join(BLOCKED_COUNTRIES[:6]) + f" 等{len(BLOCKED_COUNTRIES)}国") if len(BLOCKED_COUNTRIES) > 6 else ', '.join(BLOCKED_COUNTRIES)
+    print(f"DNS黑名单过滤：{'启用' if FILTER_BLOCKED_COUNTRIES_ENABLED else '禁用'}，黑名单国家：{bc_str}")
     print(f"IP 风险等级过滤：{'启用' if DNS_IP_RISK_FILTER_ENABLED else '禁用'}（最高允许：{DNS_IP_RISK_MAX_LEVEL}）")
     print(f"带宽测速候选数：{BANDWIDTH_CANDIDATES}，测速文件大小：{BANDWIDTH_SIZE_MB} MB，超时：{BANDWIDTH_TIMEOUT}s")
     if FILTER_COUNTRIES_ENABLED:
