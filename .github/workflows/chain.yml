@@ -1,0 +1,26 @@
+name: Generate Chain IPs
+
+on:
+  push:
+    paths:
+      - 'ip.txt'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Append Socks5 Chain
+        run: |
+          # 读取 ip.txt，并自动为每行非空内容追加住宅代理后缀
+          awk '{if(length($0)>0) print $0 "$socks5://np79673bvi:eyh5zlhuyZc59jIL@us.isp201.iisp.asia:43164"}' ip.txt > chain_ip.txt
+
+      - name: Commit and push
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add chain_ip.txt
+          git commit -m "Auto update chain_ip.txt" || exit 0
+          git push
