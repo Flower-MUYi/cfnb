@@ -1,4 +1,4 @@
-name: Generate Chain IPs
+name: Generate Hybrid Subscription
 
 on:
   push:
@@ -12,15 +12,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
-      - name: Append Socks5 Chain
+      - name: Build Combined IP List
         run: |
-          # 读取 ip.txt，并自动为每行非空内容追加住宅代理后缀
-          awk '{if(length($0)>0) print $0 "$socks5://np79673bvi:eyh5zlhuyZc59jIL@us.isp201.iisp.asia:43164"}' ip.txt > chain_ip.txt
+          # 1. 保留原本的 15 个纯优选 IP（走官方无限流量，不挂住宅代理）
+          cp ip.txt sub_nodes.txt
+          
+          # 2. 提取 ip.txt 里的第一个可用 IP，挂载美国住宅 Socks5（只生成 1 个专用住宅节点）
+          FIRST_IP=$(grep -v '^$' ip.txt | head -n 1)
+          if [ -n "$FIRST_IP" ]; then
+            echo "${FIRST_IP%#*}#🇺🇸 美国静态住宅(计费流量)\$socks5://np79673bvi:eyh5zlhuyZc59jIL@us.isp201.iisp.asia:43164" >> sub_nodes.txt
+          fi
 
-      - name: Commit and push
+      - name: Commit and Push
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add chain_ip.txt
-          git commit -m "Auto update chain_ip.txt" || exit 0
+          git add sub_nodes.txt
+          git commit -m "Auto generate hybrid nodes" || exit 0
           git push
